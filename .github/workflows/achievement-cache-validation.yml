@@ -1,0 +1,126 @@
+name: Linux profile-cache validation
+
+on:
+  push:
+    branches:
+      - "validation/skills-catalog-profile-146538"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-cache-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux-validation:
+    # This is a fork-only evidence workflow. It has no pull_request or dispatch trigger.
+    if: github.event.repository.fork == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Replace this placeholder with the exact 40-character source commit before pushing.
+      TARGET_SHA: "0a2fd9c78c2e595f65ee10683176a941e59855bc"
+      BASE_SHA: "67d47601bc5f8ed322451a672c843ed0e1a7c42c"
+      HERMES_TEST_WORKERS: "2"
+
+    steps:
+      - name: Create evidence directory outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hermes-linux-cache-validation"
+          mkdir -p "$evidence"
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'event=%s\n' "$GITHUB_EVENT_NAME"
+            printf 'ref=%s\n' "$GITHUB_REF"
+            printf 'workflow_sha=%s\n' "$GITHUB_SHA"
+            printf 'target_sha_expected=%s\n' "$TARGET_SHA"
+            printf 'base_sha=%s\n' "$BASE_SHA"
+            printf 'runner=%s\n' "${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          } > "$evidence/metadata.txt"
+
+      - name: Check out the exact source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify source and base commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hermes-linux-cache-validation"
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::TARGET_SHA must be replaced with the exact 40-character source commit SHA."
+            exit 2
+          fi
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$TARGET_SHA" ]]; then
+            echo "::error::Checked out $actual_sha, expected $TARGET_SHA."
+            exit 2
+          fi
+          base_sha="$(git rev-parse "$BASE_SHA^{commit}")"
+          {
+            printf 'target_sha_actual=%s\n' "$actual_sha"
+            printf 'base_sha_actual=%s\n' "$base_sha"
+            git show -s --format='target_commit=%H%nsubject=%s' "$actual_sha"
+            printf 'worktree_status_begin\n'
+            git status --short
+            printf 'worktree_status_end\n'
+          } | tee -a "$evidence/metadata.txt"
+
+      - name: Set up the locked Python test environment
+        id: setup-pm
+        uses: ./.github/actions/setup-pm
+        with:
+          # The action's default toolchain is Python.
+          extras: '[]'
+          test-environment: 'true'
+          cache: 'false'
+          cache-python: 'false'
+          cache-node: 'false'
+
+      - name: Run the focused cache, profile, and freshness tests
+        shell: bash
+        env:
+          HERMES_PYTHON: ${{ steps.setup-pm.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hermes-linux-cache-validation"
+          cd "$GITHUB_WORKSPACE"
+          ./scripts/run_tests.sh \
+            tests/tools/test_skills_catalog_profiles.py \
+            tests/tools/test_skills_tool_discovery_cache.py \
+            tests/tools/test_skills_tool.py \
+            tests/tools/test_skills_tool_profile_scope.py \
+            tests/agent/test_skill_commands_freshness.py \
+            tests/agent/test_skill_cache_thrash.py \
+            tests/agent/test_external_skills.py \
+            tests/agent/test_external_skills_dirs_cache.py \
+            tests/agent/test_project_skills.py \
+            tests/agent/test_skill_commands.py \
+            tests/agent/test_skill_commands_reload.py \
+            2>&1 | tee "$evidence/run_tests.log"
+
+      - name: Run all blocking checks against the recorded base
+        shell: bash
+        env:
+          HERMES_PYTHON: ${{ steps.setup-pm.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hermes-linux-cache-validation"
+          cd "$GITHUB_WORKSPACE"
+          "$HERMES_PYTHON" scripts/check --base "$BASE_SHA" \
+            2>&1 | tee "$evidence/scripts-check.log"
+
+      - name: Upload validation logs and commit metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-cache-validation-${{ github.run_id }}
+          path: ${{ runner.temp }}/hermes-linux-cache-validation/
+          if-no-files-found: warn
+          retention-days: 14
